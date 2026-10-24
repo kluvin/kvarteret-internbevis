@@ -1,0 +1,688 @@
+From bbc10de2107b8f08c63727e1b9cffa6259fdf9e7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 18:22:28 +0000
+Subject: [PATCH] feat(games): add Drikke tab with an iBeer-style virtual beer
+
+The screen is the glass: the beer surface stays level as the phone turns,
+tipping past the rim angle pours it out with glug haptics, shaking builds
+foam, and an empty glass can be refilled. Uses only expo-sensors, which is
+already in the installed binaries, so it ships over the air.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011UDGYcDH8qbFGLSHqBU6mz
+---
+ src/app/localization/translations.ts          |  23 +++
+ .../games/domain/__tests__/beerGlass.test.ts  |  88 +++++++++
+ src/features/games/domain/beerGlass.ts        | 128 +++++++++++++
+ .../games/ui/components/BeerGlassPanel.tsx    | 173 ++++++++++++++++++
+ src/features/games/ui/screens/GamesScreen.tsx |  14 +-
+ src/features/games/vm/useBeerGlass.ts         | 139 ++++++++++++++
+ 6 files changed, 561 insertions(+), 4 deletions(-)
+ create mode 100644 src/features/games/domain/__tests__/beerGlass.test.ts
+ create mode 100644 src/features/games/domain/beerGlass.ts
+ create mode 100644 src/features/games/ui/components/BeerGlassPanel.tsx
+ create mode 100644 src/features/games/vm/useBeerGlass.ts
+
+diff --git a/src/app/localization/translations.ts b/src/app/localization/translations.ts
+index 775180d..066317f 100644
+--- a/src/app/localization/translations.ts
++++ b/src/app/localization/translations.ts
+@@ -138,6 +138,18 @@ export const translations = {
+             gamesLevelPitch: "Frem/bak",
+             gamesLevelHint:
+                 "Legg telefonen flatt. Pinnsvinet går nedover til du har den helt vannrett.",
++            gamesBeer: "Drikke",
++            gamesBeerReady: "Skål! Tipp telefonen for å drikke.",
++            gamesBeerDrinking: "Glugg glugg …",
++            gamesBeerEmpty: "Tomt! Burp \u{1F37A}",
++            gamesBeerUnavailable:
++                "Denne enheten har ikke bevegelsessensor, eller appen må oppdateres.",
++            gamesBeerGlassLabel: "Ølglass, {{percent}} prosent fullt",
++            gamesBeerRefill: "Fyll på",
++            gamesBeerCount_one: "{{count}} glass drukket",
++            gamesBeerCount_other: "{{count}} glass drukket",
++            gamesBeerHint:
++                "Hold telefonen som et glass og tipp den mot munnen. Rist for mer skum. Bare på liksom – drikk ansvarlig.",
+             nerdStats: "Nerd stats",
+             nerdStatsTitle: "Nerd stats",
+             nerdStatsRuntimeSection: "Runtime",
+@@ -387,6 +399,17 @@ export const translations = {
+             gamesLevelPitch: "Front/back",
+             gamesLevelHint:
+                 "Lay the phone flat. The hedgehog walks downhill until you have it perfectly level.",
++            gamesBeer: "Drink",
++            gamesBeerReady: "Cheers! Tip the phone to drink.",
++            gamesBeerDrinking: "Glug glug …",
++            gamesBeerEmpty: "Empty! Burp \u{1F37A}",
++            gamesBeerUnavailable: "This device has no motion sensor, or the app needs an update.",
++            gamesBeerGlassLabel: "Beer glass, {{percent}} percent full",
++            gamesBeerRefill: "Refill",
++            gamesBeerCount_one: "{{count}} glass finished",
++            gamesBeerCount_other: "{{count}} glasses finished",
++            gamesBeerHint:
++                "Hold the phone like a glass and tip it toward your mouth. Shake for more foam. Just pretend – drink responsibly.",
+             nerdStats: "Nerd stats",
+             nerdStatsTitle: "Nerd stats",
+             nerdStatsRuntimeSection: "Runtime",
+diff --git a/src/features/games/domain/__tests__/beerGlass.test.ts b/src/features/games/domain/__tests__/beerGlass.test.ts
+new file mode 100644
+index 0000000..f0b4bb9
+--- /dev/null
++++ b/src/features/games/domain/__tests__/beerGlass.test.ts
+@@ -0,0 +1,88 @@
++import {
++    createFullBeer,
++    FULL_FILL,
++    isBeerEmpty,
++    MAX_FOAM,
++    MAX_POUR_PER_SECOND,
++    pourAngleFromGravity,
++    pourRate,
++    shakeFromSample,
++    smoothGravity,
++    spillAngleDeg,
++    stepBeer,
++} from "../beerGlass"
++
++const ASPECT = 1.8
++const STILL = { pourAngleDeg: 0, shakeG: 0 }
++
++describe("beerGlass", () => {
++    test("pourAngleFromGravity is 0 upright, positive turned clockwise and ±180 upside down", () => {
++        expect(pourAngleFromGravity({ x: 0, y: -1, z: 0 })).toBeCloseTo(0, 5)
++        expect(pourAngleFromGravity({ x: 1, y: 0, z: 0 })).toBeCloseTo(90, 5)
++        expect(pourAngleFromGravity({ x: -1, y: 0, z: 0 })).toBeCloseTo(-90, 5)
++        expect(Math.abs(pourAngleFromGravity({ x: 0, y: 1, z: 0 }) ?? 0)).toBeCloseTo(180, 5)
++    })
++
++    test("pourAngleFromGravity gives up when the phone lies flat or the sample is empty", () => {
++        expect(pourAngleFromGravity({ x: 0.05, y: -0.05, z: -1 })).toBeNull()
++        expect(pourAngleFromGravity({ x: 0, y: 0, z: 0 })).toBeNull()
++    })
++
++    test("smoothGravity returns the first sample and low-pass filters later ones", () => {
++        const first = { x: 0, y: -1, z: 0 }
++        expect(smoothGravity(null, first)).toEqual(first)
++        const next = smoothGravity(first, { x: 1, y: -1, z: 0 }, 0.5)
++        expect(next.x).toBeCloseTo(0.5, 5)
++        expect(next.y).toBeCloseTo(-1, 5)
++    })
++
++    test("shakeFromSample measures distance from resting gravity", () => {
++        expect(shakeFromSample({ x: 0, y: -1, z: 0 })).toBeCloseTo(0, 5)
++        expect(shakeFromSample({ x: 0, y: -2, z: 0 })).toBeCloseTo(1, 5)
++    })
++
++    test("spillAngleDeg shrinks as the glass fills and is 0 when brim-full", () => {
++        expect(spillAngleDeg(1, ASPECT)).toBeCloseTo(0, 5)
++        expect(spillAngleDeg(0.9, ASPECT)).toBeLessThan(spillAngleDeg(0.5, ASPECT))
++        expect(spillAngleDeg(0, ASPECT)).toBeLessThan(90)
++    })
++
++    test("pourRate is zero below the rim angle and capped when tipped far over", () => {
++        const spill = spillAngleDeg(FULL_FILL, ASPECT)
++        expect(pourRate(FULL_FILL, ASPECT, spill - 1)).toBe(0)
++        expect(pourRate(FULL_FILL, ASPECT, -(spill + 5))).toBeGreaterThan(0)
++        expect(pourRate(FULL_FILL, ASPECT, 180)).toBe(MAX_POUR_PER_SECOND)
++        expect(pourRate(FULL_FILL, ASPECT, null)).toBe(0)
++    })
++
++    test("an upright glass keeps its beer while the foam settles", () => {
++        const start = createFullBeer()
++        const next = stepBeer(start, STILL, 0.1, ASPECT)
++        expect(next.fill).toBe(start.fill)
++        expect(next.foam).toBeLessThan(start.foam)
++        expect(next.isPouring).toBe(false)
++    })
++
++    test("tipping the glass upside down empties it and clears the foam", () => {
++        let state = createFullBeer()
++        for (let i = 0; i < 100 && !isBeerEmpty(state); i++) {
++            state = stepBeer(state, { pourAngleDeg: 180, shakeG: 0 }, 0.1, ASPECT)
++        }
++        expect(isBeerEmpty(state)).toBe(true)
++        expect(state).toEqual({ fill: 0, foam: 0, isPouring: false })
++    })
++
++    test("pouring reports isPouring and clamps long frame gaps", () => {
++        const next = stepBeer(createFullBeer(), { pourAngleDeg: 180, shakeG: 0 }, 5, ASPECT)
++        expect(next.isPouring).toBe(true)
++        expect(next.fill).toBeCloseTo(FULL_FILL - MAX_POUR_PER_SECOND * 0.1, 5)
++    })
++
++    test("shaking builds foam up to the cap and never past the room above the beer", () => {
++        let state = createFullBeer()
++        for (let i = 0; i < 200; i++) {
++            state = stepBeer(state, { pourAngleDeg: 0, shakeG: 3 }, 0.1, ASPECT)
++        }
++        expect(state.foam).toBeCloseTo(Math.min(MAX_FOAM, 1 - FULL_FILL), 5)
++    })
++})
+diff --git a/src/features/games/domain/beerGlass.ts b/src/features/games/domain/beerGlass.ts
+new file mode 100644
+index 0000000..b0aa13b
+--- /dev/null
++++ b/src/features/games/domain/beerGlass.ts
+@@ -0,0 +1,128 @@
++// Pure maths for the virtual beer ("Drikke"), in the spirit of iBeer. The
++// screen is the glass: the beer surface stays level with the ground while the
++// phone turns, and tipping the glass past the rim angle pours the beer out.
++// Accelerometer samples follow the expo-sensors convention used by the spirit
++// level: x to the right edge, y to the top edge, upright portrait is y = -1.
++
++import type { GravitySample } from "@/features/games/domain/spiritLevel"
++
++export interface BeerState {
++    // Share of the glass height filled with beer, in [0, 1].
++    fill: number
++    // Foam head thickness as a share of the glass height, in [0, MAX_FOAM].
++    foam: number
++    isPouring: boolean
++}
++
++export interface BeerInput {
++    // In-plane rotation of the glass from upright; null when the phone lies
++    // too flat for the direction of "down" on screen to be meaningful.
++    pourAngleDeg: number | null
++    // How hard the phone is being shaken, in g beyond the resting 1 g.
++    shakeG: number
++}
++
++export const FULL_FILL = 0.82
++export const FRESH_FOAM = 0.1
++export const MAX_FOAM = 0.22
++export const MAX_POUR_PER_SECOND = 0.4
++export const POUR_RAMP_DEG = 25
++export const FOAM_SETTLE_PER_SECOND = 0.025
++export const SHAKE_THRESHOLD_G = 0.35
++export const SHAKE_FOAM_PER_G_SECOND = 0.3
++export const GRAVITY_SMOOTHING_ALPHA = 0.3
++// Below this share of gravity in the screen plane the phone is close to flat.
++export const MIN_IN_PLANE_GRAVITY = 0.3
++
++const MAX_STEP_SECONDS = 0.1
++const RAD_TO_DEG = 180 / Math.PI
++
++const clamp = (value: number, min: number, max: number): number =>
++    Math.min(max, Math.max(min, value))
++
++export const createFullBeer = (): BeerState => ({
++    fill: FULL_FILL,
++    foam: FRESH_FOAM,
++    isPouring: false,
++})
++
++export const isBeerEmpty = (state: BeerState): boolean => state.fill <= 0
++
++// Low-pass the raw vector rather than the angle so the filter never has to
++// deal with the ±180° wrap when the glass is upside down.
++export const smoothGravity = (
++    previous: GravitySample | null,
++    next: GravitySample,
++    alpha = GRAVITY_SMOOTHING_ALPHA,
++): GravitySample =>
++    previous
++        ? {
++              x: previous.x + (next.x - previous.x) * alpha,
++              y: previous.y + (next.y - previous.y) * alpha,
++              z: previous.z + (next.z - previous.z) * alpha,
++          }
++        : next
++
++// 0 when upright, positive when turned clockwise (right edge lower), ±180 when
++// upside down.
++export const pourAngleFromGravity = ({ x, y, z }: GravitySample): number | null => {
++    const magnitude = Math.hypot(x, y, z)
++    const inPlane = Math.hypot(x, y)
++    if (
++        magnitude === 0 ||
++        !Number.isFinite(magnitude) ||
++        inPlane / magnitude < MIN_IN_PLANE_GRAVITY
++    ) {
++        return null
++    }
++
++    return Math.atan2(x, -y) * RAD_TO_DEG
++}
++
++export const shakeFromSample = ({ x, y, z }: GravitySample): number => {
++    const magnitude = Math.hypot(x, y, z)
++    return Number.isFinite(magnitude) ? Math.abs(magnitude - 1) : 0
++}
++
++// For a rectangular glass of height/width `aspect`, a level surface turned by
++// θ about the glass centre rises tan(θ)/2 widths at the high edge, so beer
++// reaches the rim once tan(θ) > 2 · aspect · (1 − fill).
++export const spillAngleDeg = (fill: number, aspect: number): number =>
++    Math.atan(2 * Math.max(aspect, 0) * (1 - clamp(fill, 0, 1))) * RAD_TO_DEG
++
++export const pourRate = (fill: number, aspect: number, pourAngleDeg: number | null): number => {
++    if (pourAngleDeg === null || fill <= 0) {
++        return 0
++    }
++
++    const excessDeg = Math.abs(pourAngleDeg) - spillAngleDeg(fill, aspect)
++    return clamp(excessDeg / POUR_RAMP_DEG, 0, 1) * MAX_POUR_PER_SECOND
++}
++
++export const stepBeer = (
++    state: BeerState,
++    input: BeerInput,
++    elapsedSeconds: number,
++    aspect: number,
++): BeerState => {
++    if (isBeerEmpty(state)) {
++        return { fill: 0, foam: 0, isPouring: false }
++    }
++
++    const dt = clamp(elapsedSeconds, 0, MAX_STEP_SECONDS)
++    const rate = pourRate(state.fill, aspect, input.pourAngleDeg)
++    const fill = clamp(state.fill - rate * dt, 0, 1)
++    if (fill === 0) {
++        return { fill: 0, foam: 0, isPouring: false }
++    }
++
++    const shakeExcess = Math.max(0, input.shakeG - SHAKE_THRESHOLD_G)
++    // The head can never be thicker than the room left above the beer.
++    const foam = clamp(
++        state.foam + (shakeExcess * SHAKE_FOAM_PER_G_SECOND - FOAM_SETTLE_PER_SECOND) * dt,
++        0,
++        Math.min(MAX_FOAM, 1 - fill),
++    )
++
++    return { fill, foam, isPouring: rate > 0 }
++}
+diff --git a/src/features/games/ui/components/BeerGlassPanel.tsx b/src/features/games/ui/components/BeerGlassPanel.tsx
+new file mode 100644
+index 0000000..2d6f262
+--- /dev/null
++++ b/src/features/games/ui/components/BeerGlassPanel.tsx
+@@ -0,0 +1,173 @@
++import React from "react"
++import { useTranslation } from "react-i18next"
++import { Pressable, ScrollView, useWindowDimensions, View } from "react-native"
++import { isBeerEmpty } from "@/features/games/domain/beerGlass"
++import { useBeerGlass } from "@/features/games/vm/useBeerGlass"
++import { useThemeRuntimeColors } from "@/shared/theme/use-theme-runtime-colors"
++import { Button } from "@/shared/ui/Button"
++import { Card } from "@/shared/ui/Card"
++import { EtjenestenFooter } from "@/shared/ui/EtjenestenFooter"
++import { Text } from "@/shared/ui/Text"
++
++const BEER_COLOR = "#F2A516"
++const BEER_DEEP_COLOR = "#C97A0A"
++const FOAM_COLOR = "#FFF7E3"
++const BUBBLE_COLOR = "rgba(255, 248, 225, 0.75)"
++const GLASS_BORDER_WIDTH = 4
++
++// Fixed so the bubbles drift the same way on every render: horizontal position
++// as a share of the glass width, rise speed in glass heights per second, phase.
++const BUBBLES = [
++    { x: 0.12, speed: 0.22, phase: 0.1, size: 5 },
++    { x: 0.27, speed: 0.31, phase: 0.55, size: 4 },
++    { x: 0.38, speed: 0.18, phase: 0.8, size: 6 },
++    { x: 0.5, speed: 0.27, phase: 0.3, size: 4 },
++    { x: 0.61, speed: 0.35, phase: 0.65, size: 5 },
++    { x: 0.73, speed: 0.2, phase: 0.05, size: 6 },
++    { x: 0.86, speed: 0.29, phase: 0.45, size: 4 },
++    { x: 0.44, speed: 0.4, phase: 0.9, size: 3 },
++] as const
++
++interface BeerGlassPanelProps {
++    active: boolean
++}
++
++export const BeerGlassPanel = ({ active }: BeerGlassPanelProps): React.JSX.Element => {
++    const { t } = useTranslation()
++    const { width: windowWidth, height: windowHeight } = useWindowDimensions()
++    const { surfaceMuted, textSecondary } = useThemeRuntimeColors()
++
++    const glassWidth = Math.min(Math.max(windowWidth - 96, 180), 300)
++    const glassHeight = Math.max(Math.min(glassWidth * 1.8, windowHeight * 0.5), glassWidth)
++    const innerWidth = glassWidth - GLASS_BORDER_WIDTH * 2
++    const innerHeight = glassHeight - GLASS_BORDER_WIDTH * 2
++
++    const { status, beer, surfaceAngleDeg, clockSeconds, glassesFinished, refill } = useBeerGlass(
++        active,
++        innerHeight / innerWidth,
++    )
++    const isEmpty = isBeerEmpty(beer)
++
++    // The beer is a large slab hung from its surface line and turned about the
++    // middle of that line, so it stays level while the clipped glass rotates.
++    const slabSize = Math.hypot(innerWidth, innerHeight) * 2.5
++    const fillPx = beer.fill * innerHeight
++    const foamPx = isEmpty ? 0 : beer.foam * innerHeight
++    const surfaceTop = innerHeight - fillPx
++
++    const statusText =
++        status === "unavailable"
++            ? t("gamesBeerUnavailable")
++            : isEmpty
++              ? t("gamesBeerEmpty")
++              : beer.isPouring
++                ? t("gamesBeerDrinking")
++                : t("gamesBeerReady")
++
++    return (
++        <ScrollView
++            className="flex-1"
++            contentContainerClassName="flex-grow gap-4 p-4"
++            contentInsetAdjustmentBehavior="automatic"
++        >
++            <Card className="items-center gap-4 p-4" effect="liquid" variant="grouped">
++                <Text
++                    accessibilityLiveRegion="polite"
++                    className="text-center text-xl font-bold"
++                    style={{ color: status === "ready" && !isEmpty ? BEER_DEEP_COLOR : undefined }}
++                >
++                    {statusText}
++                </Text>
++
++                <Pressable
++                    accessibilityHint={isEmpty ? t("gamesBeerRefill") : undefined}
++                    accessibilityLabel={t("gamesBeerGlassLabel", {
++                        percent: Math.round(beer.fill * 100),
++                    })}
++                    accessibilityRole={isEmpty ? "button" : "image"}
++                    disabled={!isEmpty}
++                    onPress={refill}
++                >
++                    <View
++                        style={{
++                            width: glassWidth,
++                            height: glassHeight,
++                            borderWidth: GLASS_BORDER_WIDTH,
++                            borderColor: textSecondary,
++                            borderTopWidth: 0,
++                            borderBottomLeftRadius: 28,
++                            borderBottomRightRadius: 28,
++                            backgroundColor: surfaceMuted,
++                            overflow: "hidden",
++                        }}
++                    >
++                        {isEmpty ? null : (
++                            <View
++                                style={{
++                                    position: "absolute",
++                                    left: innerWidth / 2 - slabSize / 2,
++                                    top: surfaceTop - foamPx,
++                                    width: slabSize,
++                                    height: slabSize,
++                                    transformOrigin: ["50%", foamPx, 0],
++                                    transform: [{ rotate: `${-surfaceAngleDeg}deg` }],
++                                }}
++                            >
++                                <View style={{ height: foamPx, backgroundColor: FOAM_COLOR }} />
++                                <View style={{ flex: 1, backgroundColor: BEER_COLOR }}>
++                                    {BUBBLES.map(bubble => {
++                                        const progress =
++                                            (clockSeconds * bubble.speed + bubble.phase) % 1
++                                        return (
++                                            <View
++                                                key={`${bubble.x}-${bubble.phase}`}
++                                                style={{
++                                                    position: "absolute",
++                                                    left:
++                                                        slabSize / 2 +
++                                                        (bubble.x - 0.5) * innerWidth -
++                                                        bubble.size / 2,
++                                                    top: fillPx * (1 - progress),
++                                                    width: bubble.size,
++                                                    height: bubble.size,
++                                                    borderRadius: bubble.size / 2,
++                                                    backgroundColor: BUBBLE_COLOR,
++                                                }}
++                                            />
++                                        )
++                                    })}
++                                </View>
++                            </View>
++                        )}
++                        {isEmpty ? (
++                            <View className="flex-1 items-center justify-center">
++                                <Text style={{ fontSize: 64 }}>{"\u{1F37B}"}</Text>
++                            </View>
++                        ) : null}
++                    </View>
++                </Pressable>
++
++                <Text className="text-lg font-semibold" style={{ fontVariant: ["tabular-nums"] }}>
++                    {t("gamesBeerCount", { count: glassesFinished })}
++                </Text>
++
++                <Button onPress={refill} variant={isEmpty ? "default" : "secondary"}>
++                    <Text
++                        className={
++                            isEmpty
++                                ? "text-base leading-5 font-semibold text-surface"
++                                : "text-base leading-5 font-semibold"
++                        }
++                    >
++                        {t("gamesBeerRefill")}
++                    </Text>
++                </Button>
++
++                <Text className="text-center text-xs text-text-secondary">
++                    {t("gamesBeerHint")}
++                </Text>
++            </Card>
++            <EtjenestenFooter />
++        </ScrollView>
++    )
++}
+diff --git a/src/features/games/ui/screens/GamesScreen.tsx b/src/features/games/ui/screens/GamesScreen.tsx
+index ed9ffdd..a88f91e 100644
+--- a/src/features/games/ui/screens/GamesScreen.tsx
++++ b/src/features/games/ui/screens/GamesScreen.tsx
+@@ -18,6 +18,7 @@ import {
+     parseStoredChessTimeControl,
+     updateDraftChessTimeControlState,
+ } from "@/features/games/domain/chessTimeControl"
++import { BeerGlassPanel } from "@/features/games/ui/components/BeerGlassPanel"
+ import { DiceFullScreen } from "@/features/games/ui/components/DiceFullScreen"
+ import { Die3D } from "@/features/games/ui/components/Die3D"
+ import { SpiritLevelPanel } from "@/features/games/ui/components/SpiritLevelPanel"
+@@ -31,7 +32,7 @@ import { EtjenestenFooter } from "@/shared/ui/EtjenestenFooter"
+ import { Text } from "@/shared/ui/Text"
+ import { cn } from "@/shared/utils/cn"
+ 
+-type GameMode = "d6" | "chess" | "level"
++type GameMode = "d6" | "chess" | "level" | "beer"
+ type MaterialIconName = React.ComponentProps<typeof MaterialIcons>["name"]
+ 
+ const DEFAULT_CHESS_TIME_CONTROL = getDefaultChessTimeControl()
+@@ -171,7 +172,7 @@ const GameModeTabs = ({
+                     <Pressable
+                         key={tab.mode}
+                         className={cn(
+-                            "flex-1 rounded-lg px-3 py-2",
++                            "flex-1 rounded-lg px-1 py-2",
+                             isSelected ? "bg-editorial-surface" : "bg-transparent",
+                         )}
+                         onPress={() => onSelectMode(tab.mode)}
+@@ -179,6 +180,8 @@ const GameModeTabs = ({
+                         accessibilityState={{ selected: isSelected }}
+                     >
+                         <Text
++                            adjustsFontSizeToFit
++                            numberOfLines={1}
+                             className={cn(
+                                 "text-center text-sm font-semibold",
+                                 isSelected ? null : "text-text-secondary",
+@@ -293,6 +296,7 @@ export const GamesScreen = (): React.JSX.Element => {
+         { mode: "chess" as const, label: t("gamesChessTimer") },
+         { mode: "d6" as const, label: t("gamesDice") },
+         { mode: "level" as const, label: t("gamesLevel") },
++        { mode: "beer" as const, label: t("gamesBeer") },
+     ]
+ 
+     const timerIsPristine = isChessTimerPristine(timerState, timeControlState.appliedTimeControl)
+@@ -322,7 +326,7 @@ export const GamesScreen = (): React.JSX.Element => {
+     const whiteTimerBorderColor = whiteTimerActive ? stateDanger : inactiveTimerBorderColor
+     const effectiveTop = Math.max(headerHeight, safeTop)
+     const dieSize = Math.min(Math.max(windowWidth - 120, 160), 240)
+-    const inlineTabsWidth = Math.min(Math.max(windowWidth - 48, 220), 320)
++    const inlineTabsWidth = Math.min(Math.max(windowWidth - 32, 220), 400)
+ 
+     const handleOpenTimeControl = useCallback((): void => {
+         router.push("/chess-time-control")
+@@ -347,7 +351,9 @@ export const GamesScreen = (): React.JSX.Element => {
+                     width={inlineTabsWidth}
+                 />
+             </View>
+-            {mode === "level" ? (
++            {mode === "beer" ? (
++                <BeerGlassPanel active />
++            ) : mode === "level" ? (
+                 <SpiritLevelPanel active />
+             ) : mode === "d6" ? (
+                 <ScrollView
+diff --git a/src/features/games/vm/useBeerGlass.ts b/src/features/games/vm/useBeerGlass.ts
+new file mode 100644
+index 0000000..069c644
+--- /dev/null
++++ b/src/features/games/vm/useBeerGlass.ts
+@@ -0,0 +1,139 @@
++import { Accelerometer } from "expo-sensors"
++import { useCallback, useEffect, useRef, useState } from "react"
++import {
++    BeerState,
++    createFullBeer,
++    isBeerEmpty,
++    pourAngleFromGravity,
++    shakeFromSample,
++    smoothGravity,
++    stepBeer,
++} from "@/features/games/domain/beerGlass"
++import type { GravitySample } from "@/features/games/domain/spiritLevel"
++import { triggerSelectionHaptic, triggerSoftImpactHaptic } from "@/shared/utils/haptics"
++
++const SENSOR_INTERVAL_MS = 33
++const GLUG_INTERVAL_MS = 260
++const DEFAULT_ASPECT = 1.8
++
++export type BeerGlassStatus = "loading" | "unavailable" | "ready"
++
++interface UseBeerGlassResult {
++    status: BeerGlassStatus
++    beer: BeerState
++    // Rotation of the glass from upright; the beer surface is drawn at minus this.
++    surfaceAngleDeg: number
++    // Seconds since the sensor started, used to drift the bubbles.
++    clockSeconds: number
++    glassesFinished: number
++    refill: () => void
++}
++
++// Same over-the-air caveat as the spirit level: binaries without the native
++// sensor module degrade to "unavailable" instead of throwing.
++export const useBeerGlass = (enabled: boolean, aspect: number): UseBeerGlassResult => {
++    const [status, setStatus] = useState<BeerGlassStatus>("loading")
++    const [beer, setBeer] = useState<BeerState>(createFullBeer)
++    const [surfaceAngleDeg, setSurfaceAngleDeg] = useState(0)
++    const [clockSeconds, setClockSeconds] = useState(0)
++    const [glassesFinished, setGlassesFinished] = useState(0)
++    const beerRef = useRef(beer)
++    const aspectRef = useRef(aspect > 0 ? aspect : DEFAULT_ASPECT)
++    const gravityRef = useRef<GravitySample | null>(null)
++    const angleRef = useRef(0)
++    const startedAtRef = useRef<number | null>(null)
++    const lastSampleAtRef = useRef<number | null>(null)
++    const lastGlugAtRef = useRef(0)
++
++    useEffect(() => {
++        if (aspect > 0) {
++            aspectRef.current = aspect
++        }
++    }, [aspect])
++
++    const refill = useCallback((): void => {
++        const fresh = createFullBeer()
++        beerRef.current = fresh
++        setBeer(fresh)
++    }, [])
++
++    useEffect(() => {
++        if (!enabled) {
++            return
++        }
++
++        let isMounted = true
++        let subscription: { remove: () => void } | null = null
++
++        const handleSample = (sample: GravitySample): void => {
++            const now = Date.now()
++            const elapsedSeconds =
++                lastSampleAtRef.current === null ? 0 : (now - lastSampleAtRef.current) / 1000
++            lastSampleAtRef.current = now
++            startedAtRef.current ??= now
++
++            const smoothed = smoothGravity(gravityRef.current, sample)
++            gravityRef.current = smoothed
++            const pourAngleDeg = pourAngleFromGravity(smoothed)
++            // Lying flat there is no on-screen "down", so keep the last surface angle.
++            if (pourAngleDeg !== null) {
++                angleRef.current = pourAngleDeg
++            }
++
++            const previous = beerRef.current
++            const next = stepBeer(
++                previous,
++                { pourAngleDeg, shakeG: shakeFromSample(sample) },
++                elapsedSeconds,
++                aspectRef.current,
++            )
++            beerRef.current = next
++
++            if (next.isPouring && now - lastGlugAtRef.current >= GLUG_INTERVAL_MS) {
++                lastGlugAtRef.current = now
++                void triggerSoftImpactHaptic()
++            }
++            if (isBeerEmpty(next) && !isBeerEmpty(previous)) {
++                setGlassesFinished(count => count + 1)
++                void triggerSelectionHaptic()
++            }
++
++            setBeer(next)
++            setSurfaceAngleDeg(angleRef.current)
++            setClockSeconds((now - startedAtRef.current) / 1000)
++        }
++
++        const start = async (): Promise<void> => {
++            try {
++                const isAvailable = await Accelerometer.isAvailableAsync()
++                if (!isMounted) {
++                    return
++                }
++                if (!isAvailable) {
++                    setStatus("unavailable")
++                    return
++                }
++
++                Accelerometer.setUpdateInterval(SENSOR_INTERVAL_MS)
++                subscription = Accelerometer.addListener(handleSample)
++                setStatus("ready")
++            } catch {
++                if (isMounted) {
++                    setStatus("unavailable")
++                }
++            }
++        }
++
++        void start()
++
++        return () => {
++            isMounted = false
++            subscription?.remove()
++            gravityRef.current = null
++            lastSampleAtRef.current = null
++            startedAtRef.current = null
++        }
++    }, [enabled])
++
++    return { status, beer, surfaceAngleDeg, clockSeconds, glassesFinished, refill }
++}
+-- 
+2.43.0
+
